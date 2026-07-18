@@ -10,11 +10,13 @@ Tests cover:
 import json
 import os
 import signal
+import subprocess
 import sys
 import textwrap
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -36,6 +38,331 @@ def _capturing_popen(captured):
             return "ok\n", ""
 
     return FakePopen
+
+
+def test_windows_job_runner_releases_assignment_handle_before_spawning_child():
+    from cron import _windows_job_runner as runner
+
+    events = []
+
+    class FakeJob:
+        def assign_current_process(self):
+            events.append("assign")
+
+        def close(self):
+            events.append("close")
+
+    class FakeChild:
+        def wait(self):
+            events.append("wait")
+            return 7
+
+    def fake_popen(argv, **kwargs):
+        events.append(("spawn", argv, kwargs))
+        return FakeChild()
+
+    returncode = runner.run_child_in_job(
+        ["python.exe", "script.py"],
+        job=FakeJob(),
+        popen_factory=fake_popen,
+    )
+
+    assert returncode == 7
+    assert events == [
+        "assign",
+        "close",
+        (
+            "spawn",
+            ["python.exe", "script.py"],
+            {"creationflags": runner._CREATE_NO_WINDOW},
+        ),
+        "wait",
+    ]
+
+
+def test_windows_job_runner_configures_kill_on_close(monkeypatch):
+    from cron import _windows_job_runner as runner
+
+    observed = {}
+
+    class FakeFunction:
+        def __init__(self, callback):
+            self.callback = callback
+
+        def __call__(self, *args):
+            return self.callback(*args)
+
+    def set_information(handle, info_class, info_pointer, info_size):
+        info = cast(Any, info_pointer)._obj
+        observed.setdefault("set_information", []).append(
+            (
+                handle,
+                info_class,
+                info.BasicLimitInformation.LimitFlags,
+                info_size,
+            )
+        )
+        return 1
+
+    def assign(job_handle, process_handle):
+        observed["assign"] = (job_handle, process_handle)
+        return 1
+
+    def close(handle):
+        observed.setdefault("closed", []).append(handle)
+        return 1
+
+    def create_job(_attrs, name):
+        observed["created_name"] = name
+        return 101
+
+    def terminate_job(handle, exit_code):
+        observed["terminated"] = (handle, exit_code)
+        return 1
+
+    class FakeKernel32:
+        CreateJobObjectW = FakeFunction(create_job)
+        OpenJobObjectW = FakeFunction(lambda *_args: 303)
+        GetCurrentProcess = FakeFunction(lambda: 202)
+        SetInformationJobObject = FakeFunction(set_information)
+        AssignProcessToJobObject = FakeFunction(assign)
+        TerminateJobObject = FakeFunction(terminate_job)
+        CloseHandle = FakeFunction(close)
+
+    fake_kernel = FakeKernel32()
+    monkeypatch.setattr(runner.sys, "platform", "win32")
+    monkeypatch.setattr(
+        runner.ctypes, "WinDLL", lambda *_args, **_kwargs: fake_kernel,
+        raising=False,
+    )
+
+    job = runner._KillOnCloseJob("Local\\HermesCron-test-owner")
+    job.assign_current_process()
+    job.terminate(99)
+    job.disarm_kill_on_close()
+    job.close()
+
+    handle, info_class, limit_flags, info_size = observed["set_information"][0]
+    assert handle == 101
+    assert info_class == runner._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION
+    assert limit_flags & runner._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    assert info_size > 0
+    assert observed["set_information"][1][2] == 0
+    assert observed["created_name"] == "Local\\HermesCron-test-owner"
+    assert observed["assign"] == (101, 202)
+    assert observed["terminated"] == (101, 99)
+    assert observed["closed"] == [101]
+
+
+def test_windows_job_runner_opens_scheduler_job_for_assignment(monkeypatch):
+    from cron import _windows_job_runner as runner
+
+    observed = {}
+
+    class FakeFunction:
+        def __init__(self, callback):
+            self.callback = callback
+
+        def __call__(self, *args):
+            return self.callback(*args)
+
+    def open_job(access, inherit, name):
+        observed["opened"] = (access, inherit, name)
+        return 303
+
+    def assign(job_handle, process_handle):
+        observed["assigned"] = (job_handle, process_handle)
+        return 1
+
+    def close(handle):
+        observed.setdefault("closed", []).append(handle)
+        return 1
+
+    class FakeKernel32:
+        CreateJobObjectW = FakeFunction(lambda *_args: pytest.fail("must open"))
+        OpenJobObjectW = FakeFunction(open_job)
+        GetCurrentProcess = FakeFunction(lambda: 404)
+        SetInformationJobObject = FakeFunction(lambda *_args: 1)
+        AssignProcessToJobObject = FakeFunction(assign)
+        TerminateJobObject = FakeFunction(lambda *_args: 1)
+        CloseHandle = FakeFunction(close)
+
+    monkeypatch.setattr(runner.sys, "platform", "win32")
+    monkeypatch.setattr(
+        runner.ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: FakeKernel32(),
+        raising=False,
+    )
+
+    job = runner._KillOnCloseJob.open_existing("Local\\HermesCron-test-owner")
+    job.assign_current_process()
+    job.close()
+
+    assert observed["opened"] == (
+        runner._JOB_OBJECT_ASSIGN_PROCESS,
+        False,
+        "Local\\HermesCron-test-owner",
+    )
+    assert observed["assigned"] == (303, 404)
+    assert observed["closed"] == [303]
+
+
+def test_windows_job_runner_main_requires_scheduler_job(monkeypatch):
+    from cron import _windows_job_runner as runner
+
+    captured = {}
+    assignment_job = object()
+
+    monkeypatch.setattr(
+        runner._KillOnCloseJob,
+        "open_existing",
+        classmethod(
+            lambda _cls, name: captured.setdefault("opened", (name, assignment_job))[1]
+        ),
+    )
+
+    def fake_run(argv, *, job, popen_factory=runner.subprocess.Popen):
+        captured["run"] = (argv, job, popen_factory)
+        return 7
+
+    monkeypatch.setattr(runner, "run_child_in_job", fake_run)
+
+    returncode = runner.main(
+        [
+            "--job-name",
+            "Local\\HermesCron-test-owner",
+            "--",
+            "python.exe",
+            "script.py",
+        ]
+    )
+
+    assert returncode == 7
+    assert captured["opened"] == ("Local\\HermesCron-test-owner", assignment_job)
+    assert captured["run"][0] == ["python.exe", "script.py"]
+    assert captured["run"][1] is assignment_job
+
+
+def test_windows_job_runner_assignment_failure_never_spawns_child():
+    from cron import _windows_job_runner as runner
+
+    events = []
+
+    class RejectingJob:
+        def assign_current_process(self):
+            events.append("assign")
+            raise OSError("nested job rejected")
+
+        def close(self):
+            events.append("close")
+
+    def forbidden_popen(*_args, **_kwargs) -> Any:
+        pytest.fail("script child must not spawn after assignment failure")
+
+    with pytest.raises(OSError, match="nested job rejected"):
+        runner.run_child_in_job(
+            ["python.exe", "script.py"],
+            job=RejectingJob(),
+            popen_factory=forbidden_popen,
+        )
+
+    assert events == ["assign", "close"]
+
+
+def test_windows_job_runner_main_reports_open_job_failure(monkeypatch, capsys):
+    from cron import _windows_job_runner as runner
+
+    monkeypatch.setattr(
+        runner._KillOnCloseJob,
+        "open_existing",
+        classmethod(
+            lambda _cls, _name: (_ for _ in ()).throw(
+                OSError("OpenJobObjectW failed")
+            )
+        ),
+    )
+
+    returncode = runner.main(
+        ["--job-name", "missing-job", "--", "python.exe", "script.py"]
+    )
+
+    assert returncode == 125
+    assert "OpenJobObjectW failed" in capsys.readouterr().err
+
+
+def test_windows_job_owner_closes_handle_when_limit_configuration_fails(monkeypatch):
+    from cron import _windows_job_runner as runner
+
+    closed = []
+
+    class FakeFunction:
+        def __init__(self, callback):
+            self.callback = callback
+
+        def __call__(self, *args):
+            return self.callback(*args)
+
+    class FakeKernel32:
+        CreateJobObjectW = FakeFunction(lambda *_args: 101)
+        OpenJobObjectW = FakeFunction(lambda *_args: 303)
+        GetCurrentProcess = FakeFunction(lambda: 202)
+        SetInformationJobObject = FakeFunction(lambda *_args: 0)
+        AssignProcessToJobObject = FakeFunction(lambda *_args: 1)
+        TerminateJobObject = FakeFunction(lambda *_args: 1)
+        CloseHandle = FakeFunction(lambda handle: closed.append(handle) or 1)
+
+    monkeypatch.setattr(runner.sys, "platform", "win32")
+    monkeypatch.setattr(
+        runner.ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: FakeKernel32(),
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match="Windows API call failed"):
+        runner._KillOnCloseJob("Local\\HermesCron-broken")
+
+    assert closed == [101]
+
+
+def test_windows_job_owner_rejects_existing_named_job(monkeypatch):
+    from cron import _windows_job_runner as runner
+
+    closed = []
+
+    class FakeFunction:
+        def __init__(self, callback):
+            self.callback = callback
+
+        def __call__(self, *args):
+            return self.callback(*args)
+
+    class FakeKernel32:
+        CreateJobObjectW = FakeFunction(lambda *_args: 101)
+        OpenJobObjectW = FakeFunction(lambda *_args: 303)
+        GetCurrentProcess = FakeFunction(lambda: 202)
+        SetInformationJobObject = FakeFunction(
+            lambda *_args: pytest.fail("must not reconfigure an existing named Job")
+        )
+        AssignProcessToJobObject = FakeFunction(lambda *_args: 1)
+        TerminateJobObject = FakeFunction(lambda *_args: 1)
+        CloseHandle = FakeFunction(lambda handle: closed.append(handle) or 1)
+
+    monkeypatch.setattr(runner.sys, "platform", "win32")
+    monkeypatch.setattr(
+        runner.ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: FakeKernel32(),
+        raising=False,
+    )
+    monkeypatch.setattr(runner.ctypes, "set_last_error", lambda _error: None, raising=False)
+    monkeypatch.setattr(runner.ctypes, "get_last_error", lambda: 183, raising=False)
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        runner._KillOnCloseJob("Local\\HermesCron-collision")
+
+    assert closed == [101]
 
 
 @pytest.fixture
@@ -163,6 +490,7 @@ class TestRunJobScript:
         assert success is False
         assert "exited with code 1" in output
         assert "error info" in output
+        assert "partial output" in output
 
     def test_script_subprocess_env_sanitized(self, cron_env, monkeypatch):
         """Cron scripts must not inherit Hermes provider env (SECURITY.md §2.3)."""
@@ -211,20 +539,97 @@ class TestRunJobScript:
 
         captured = {}
 
+        class FakeWindowsJob:
+            name = "Local\\HermesCron-test-owner"
+
+            def __init__(self):
+                self.events = []
+
+            def disarm_kill_on_close(self):
+                self.events.append("disarm")
+
+            def close(self):
+                self.events.append("close")
+
+        windows_job = FakeWindowsJob()
+
         monkeypatch.setattr(sched_mod.sys, "platform", "win32")
         monkeypatch.setattr(sched_mod.sys, "executable", str(venv_python))
         monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
+        monkeypatch.setattr(
+            sched_mod, "_create_windows_cron_job", lambda: windows_job
+        )
         monkeypatch.setattr(sched_mod.subprocess, "Popen", _capturing_popen(captured))
 
         success, output = _run_job_script("probe.py")
 
         assert success is True
         assert output == "ok"
-        assert captured["argv"] == [str(base_python), str(script.resolve())]
-        assert captured["kwargs"]["creationflags"] == 0x08000200
+        assert captured["argv"] == [
+            str(base_python),
+            str(Path(sched_mod.__file__).with_name("_windows_job_runner.py")),
+            "--job-name",
+            windows_job.name,
+            "--",
+            str(base_python),
+            str(script.resolve()),
+        ]
+        assert captured["kwargs"]["creationflags"] == 0x09000000
         env = captured["kwargs"]["env"]
         assert env["VIRTUAL_ENV"] == str(venv)
         assert str(site_packages) in env["PYTHONPATH"]
+        assert windows_job.events == ["disarm", "close"]
+
+    def test_windows_breakaway_denied_retries_inside_parent_job(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "probe.py"
+        script.write_text('print("ok")\n')
+
+        class FakeWindowsJob:
+            name = "Local\\HermesCron-test-owner"
+
+            def __init__(self):
+                self.events = []
+
+            def disarm_kill_on_close(self):
+                self.events.append("disarm")
+
+            def close(self):
+                self.events.append("close")
+
+        class FakeProcess:
+            pid = 4242
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return "ok\n", ""
+
+        windows_job = FakeWindowsJob()
+        creationflags = []
+
+        def fake_popen(_argv, **kwargs):
+            creationflags.append(kwargs["creationflags"])
+            if len(creationflags) == 1:
+                raise PermissionError("breakaway denied")
+            return FakeProcess()
+
+        monkeypatch.setattr(sched_mod.sys, "platform", "win32")
+        monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
+        monkeypatch.setattr(
+            sched_mod, "_create_windows_cron_job", lambda: windows_job
+        )
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", fake_popen)
+
+        success, output = _run_job_script("probe.py")
+
+        assert success is True
+        assert output == "ok"
+        assert creationflags == [0x09000000, 0x08000000]
+        assert windows_job.events == ["disarm", "close"]
 
     def test_windows_pythonw_script_uses_sibling_python_for_captured_output(self, cron_env, tmp_path, monkeypatch):
         from cron import scheduler as sched_mod
@@ -243,19 +648,45 @@ class TestRunJobScript:
 
         captured = {}
 
+        class FakeWindowsJob:
+            name = "Local\\HermesCron-test-owner"
+
+            def __init__(self):
+                self.events = []
+
+            def disarm_kill_on_close(self):
+                self.events.append("disarm")
+
+            def close(self):
+                self.events.append("close")
+
+        windows_job = FakeWindowsJob()
+
         monkeypatch.setattr(sched_mod.sys, "platform", "win32")
         monkeypatch.setattr(sched_mod.sys, "executable", str(pythonw))
         monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
+        monkeypatch.setattr(
+            sched_mod, "_create_windows_cron_job", lambda: windows_job
+        )
         monkeypatch.setattr(sched_mod.subprocess, "Popen", _capturing_popen(captured))
 
         success, output = _run_job_script("probe.py")
 
         assert success is True
         assert output == "ok"
-        assert captured["argv"] == [str(python), str(script.resolve())]
-        assert captured["kwargs"]["creationflags"] == 0x08000200
+        assert captured["argv"] == [
+            str(python),
+            str(Path(sched_mod.__file__).with_name("_windows_job_runner.py")),
+            "--job-name",
+            windows_job.name,
+            "--",
+            str(python),
+            str(script.resolve()),
+        ]
+        assert captured["kwargs"]["creationflags"] == 0x09000000
         assert captured["kwargs"]["encoding"] == "utf-8"
         assert captured["kwargs"]["errors"] == "replace"
+        assert windows_job.events == ["disarm", "close"]
 
     def test_non_windows_script_preserves_default_text_decoding(self, cron_env, monkeypatch):
         from cron import scheduler as sched_mod
@@ -304,6 +735,374 @@ class TestRunJobScript:
         assert success is False
         assert "timed out" in output.lower()
 
+    def test_windows_timeout_terminates_owned_job_after_helper_exits(self, monkeypatch):
+        """A won timeout must terminate descendants without reusing a PID."""
+        from cron import scheduler as sched_mod
+
+        class RootExitedDuringTerminate:
+            pid = 4242
+            returncode = 0
+            terminate_attempts = 0
+
+            def terminate(self):
+                self.terminate_attempts += 1
+
+            def poll(self):
+                return self.returncode
+
+            def communicate(self, timeout=None):
+                return "", ""
+
+        class OwnedJobWithLiveDescendant:
+            descendant_alive = True
+            terminate_attempts = 0
+
+            def terminate(self):
+                self.terminate_attempts += 1
+                self.descendant_alive = False
+
+        proc = RootExitedDuringTerminate()
+        job = OwnedJobWithLiveDescendant()
+
+        monkeypatch.setattr(sched_mod.sys, "platform", "win32")
+        monkeypatch.setattr(
+            sched_mod.subprocess,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail(
+                "timeout cleanup must not target a reapable/reusable PID"
+            ),
+        )
+
+        sched_mod._terminate_script_process_tree(
+            cast(Any, proc), pgid=None, windows_job=cast(Any, job)
+        )
+
+        assert proc.terminate_attempts == 1
+        assert job.terminate_attempts == 1
+        assert job.descendant_alive is False
+
+    def test_windows_hidden_process_does_not_rely_on_ctrl_break_or_pid(self, monkeypatch):
+        """CREATE_NO_WINDOW cleanup uses process and Job handles only."""
+        from cron import scheduler as sched_mod
+
+        class HiddenProcessWithLiveChild:
+            pid = 4242
+            returncode = None
+            ctrl_break_attempts = 0
+            terminate_attempts = 0
+
+            def send_signal(self, _sig):
+                self.ctrl_break_attempts += 1
+                raise OSError("no console")
+
+            def terminate(self):
+                self.terminate_attempts += 1
+
+            def wait(self, timeout=None):
+                raise sched_mod.subprocess.TimeoutExpired(
+                    "hidden", float(timeout or 0)
+                )
+
+            def poll(self):
+                return self.returncode
+
+            def communicate(self, timeout=None):
+                return "", ""
+
+            def kill(self):
+                self.returncode = 1
+
+        proc = HiddenProcessWithLiveChild()
+        class OwnedJob:
+            terminate_attempts = 0
+
+            def terminate(self):
+                self.terminate_attempts += 1
+                proc.returncode = 1
+
+        windows_job = OwnedJob()
+
+        monkeypatch.setattr(sched_mod.sys, "platform", "win32")
+        monkeypatch.setattr(sched_mod.signal, "CTRL_BREAK_EVENT", 1, raising=False)
+        monkeypatch.setattr(
+            sched_mod.subprocess,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail("must not target a numeric PID"),
+        )
+
+        sched_mod._terminate_script_process_tree(
+            cast(Any, proc), pgid=None, windows_job=cast(Any, windows_job)
+        )
+
+        assert proc.ctrl_break_attempts == 0
+        assert proc.terminate_attempts == 1
+        assert windows_job.terminate_attempts == 1
+
+    def test_windows_terminate_job_failure_still_closes_armed_owner(
+        self, cron_env, monkeypatch, caplog
+    ):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "slow.py"
+        script.write_text("import time; time.sleep(30)\n")
+
+        class FailingTerminateJob:
+            name = "Local\\HermesCron-test-owner"
+
+            def __init__(self):
+                self.events = []
+
+            def terminate(self):
+                self.events.append("terminate")
+                raise OSError("TerminateJobObject failed")
+
+            def disarm_kill_on_close(self):
+                self.events.append("disarm")
+
+            def close(self):
+                self.events.append("close")
+
+        class TimedOutProcess:
+            pid = 4242
+            returncode = None
+            terminate_attempts = 0
+            communicate_attempts = 0
+
+            def communicate(self, timeout=None):
+                self.communicate_attempts += 1
+                if self.communicate_attempts == 1:
+                    raise sched_mod.subprocess.TimeoutExpired(
+                        "helper", float(timeout or 0)
+                    )
+                self.returncode = 1
+                return "", ""
+
+            def terminate(self):
+                self.terminate_attempts += 1
+
+        windows_job = FailingTerminateJob()
+        proc = TimedOutProcess()
+        monkeypatch.setattr(sched_mod.sys, "platform", "win32")
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
+        monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
+        monkeypatch.setattr(
+            sched_mod, "_create_windows_cron_job", lambda: windows_job
+        )
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", lambda *_a, **_kw: proc)
+        monkeypatch.setattr(
+            sched_mod.subprocess,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail("must not target a numeric PID"),
+        )
+
+        success, output = _run_job_script("slow.py")
+
+        assert success is False
+        assert "timed out" in output.lower()
+        assert proc.terminate_attempts == 1
+        assert windows_job.events == ["terminate", "close"]
+        assert "Failed to terminate timed-out Windows cron Job Object" in caplog.text
+
+    @pytest.mark.live_system_guard_bypass
+    @pytest.mark.skipif(
+        sys.platform != "win32", reason="Windows Job Object regression"
+    )
+    def test_windows_timeout_terminates_descendant_with_job_object(
+        self, cron_env, monkeypatch
+    ):
+        """Native Windows: root termination must reap a live descendant."""
+        import psutil
+
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
+        monkeypatch.setattr(
+            sched_mod, "_SCRIPT_TERMINATE_GRACE_SECONDS", 0.2, raising=False
+        )
+
+        child_pid_file = cron_env / "windows-child.pid"
+        script = cron_env / "scripts" / "spawns_windows_child.py"
+        script.write_text(
+            textwrap.dedent(
+                f"""\
+                import subprocess
+                import sys
+                import time
+                from pathlib import Path
+
+                child = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                Path({str(child_pid_file)!r}).write_text(str(child.pid))
+                time.sleep(30)
+                """
+            )
+        )
+
+        success, output = _run_job_script(str(script))
+
+        assert success is False
+        assert "timed out" in output.lower()
+        assert child_pid_file.exists()
+        child_pid = int(child_pid_file.read_text())
+        try:
+            deadline = time.monotonic() + 3
+            while psutil.pid_exists(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not psutil.pid_exists(child_pid), (
+                f"orphaned Windows child process still alive: {child_pid}"
+            )
+        finally:
+            if psutil.pid_exists(child_pid):
+                psutil.Process(child_pid).kill()
+
+    @pytest.mark.live_system_guard_bypass
+    @pytest.mark.skipif(
+        sys.platform != "win32", reason="Windows Job Object race regression"
+    )
+    def test_windows_timeout_wins_before_script_exits_with_live_descendant(
+        self, cron_env, monkeypatch
+    ):
+        """The scheduler-owned Job remains armed after the helper exits."""
+        import psutil
+
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
+        monkeypatch.setattr(
+            sched_mod, "_SCRIPT_TERMINATE_GRACE_SECONDS", 0.2, raising=False
+        )
+
+        release_file = cron_env / "release-script"
+        script_pid_file = cron_env / "windows-script.pid"
+        child_pid_file = cron_env / "windows-race-child.pid"
+        script = cron_env / "scripts" / "windows_timeout_race.py"
+        script.write_text(
+            textwrap.dedent(
+                f"""\
+                import os
+                import subprocess
+                import sys
+                import time
+                from pathlib import Path
+
+                release = Path({str(release_file)!r})
+                child = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                Path({str(script_pid_file)!r}).write_text(str(os.getpid()))
+                Path({str(child_pid_file)!r}).write_text(str(child.pid))
+                while not release.exists():
+                    time.sleep(0.01)
+                """
+            )
+        )
+
+        original_cleanup = sched_mod._terminate_script_process_tree
+
+        def exit_script_before_cleanup(proc, *, pgid, windows_job=None):
+            deadline = time.monotonic() + 3
+            while (
+                not script_pid_file.exists() or not child_pid_file.exists()
+            ) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert script_pid_file.exists()
+            assert child_pid_file.exists()
+
+            script_pid = int(script_pid_file.read_text())
+            child_pid = int(child_pid_file.read_text())
+            release_file.write_text("exit")
+            while psutil.pid_exists(script_pid) and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            assert not psutil.pid_exists(script_pid), "script did not exit in cleanup window"
+            assert psutil.pid_exists(child_pid), "descendant exited before cleanup assertion"
+            return original_cleanup(
+                proc,
+                pgid=pgid,
+                windows_job=windows_job,
+            )
+
+        monkeypatch.setattr(
+            sched_mod,
+            "_terminate_script_process_tree",
+            exit_script_before_cleanup,
+        )
+
+        success, output = _run_job_script(str(script))
+
+        assert success is False
+        assert "timed out" in output.lower()
+        child_pid = int(child_pid_file.read_text())
+        try:
+            deadline = time.monotonic() + 3
+            while psutil.pid_exists(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not psutil.pid_exists(child_pid), (
+                f"orphaned Windows race child still alive: {child_pid}"
+            )
+        finally:
+            if psutil.pid_exists(child_pid):
+                psutil.Process(child_pid).kill()
+
+    @pytest.mark.live_system_guard_bypass
+    @pytest.mark.skipif(
+        sys.platform != "win32", reason="Windows nested Job Object regression"
+    )
+    def test_windows_restrictive_parent_job_uses_nested_job_fallback(
+        self, cron_env, tmp_path
+    ):
+        """BREAKAWAY denial retries inside the restrictive parent Job."""
+        script = cron_env / "scripts" / "nested_probe.py"
+        script.write_text('print("nested-ok")\n')
+        harness = tmp_path / "nested_job_harness.py"
+        harness.write_text(
+            textwrap.dedent(
+                """\
+                import json
+                import uuid
+
+                from cron._windows_job_runner import _KillOnCloseJob
+                from cron.scheduler import _run_job_script
+
+                outer = _KillOnCloseJob(
+                    f"HermesCron-test-outer-{uuid.uuid4().hex}"
+                )
+                try:
+                    outer.assign_current_process()
+                    result = _run_job_script("nested_probe.py")
+                    print(json.dumps(result))
+                finally:
+                    outer.disarm_kill_on_close()
+                    outer.close()
+                """
+            )
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(harness)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            cwd=str(Path(__file__).resolve().parents[2]),
+            env=os.environ.copy(),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout.strip().splitlines()[-1]) == [
+            True,
+            "nested-ok",
+        ]
+
     @pytest.mark.live_system_guard_bypass
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group regression")
     def test_script_timeout_terminates_descendant_process_group(self, cron_env, monkeypatch):
@@ -350,7 +1149,7 @@ class TestRunJobScript:
 
         def child_is_alive() -> bool:
             try:
-                os.kill(child_pid, 0)
+                os.kill(child_pid, 0)  # windows-footgun: ok — POSIX-only test
             except ProcessLookupError:
                 return False
             except PermissionError:
@@ -364,7 +1163,7 @@ class TestRunJobScript:
             assert not child_is_alive(), f"orphaned child process still alive: {child_pid}"
         finally:
             if child_is_alive():
-                os.kill(child_pid, signal.SIGKILL)
+                os.kill(child_pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only test
 
     @pytest.mark.live_system_guard_bypass
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group regression")
@@ -413,7 +1212,7 @@ class TestRunJobScript:
 
         def child_is_alive() -> bool:
             try:
-                os.kill(child_pid, 0)
+                os.kill(child_pid, 0)  # windows-footgun: ok — POSIX-only test
             except ProcessLookupError:
                 return False
             except PermissionError:
@@ -427,7 +1226,7 @@ class TestRunJobScript:
             assert not child_is_alive(), f"detached child process still alive: {child_pid}"
         finally:
             if child_is_alive():
-                os.kill(child_pid, signal.SIGKILL)
+                os.kill(child_pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only test
 
     def test_script_json_output(self, cron_env):
         """Scripts can output structured JSON for the LLM to parse."""
