@@ -2019,6 +2019,9 @@ _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 _SCRIPT_TERMINATE_GRACE_SECONDS = 10.0
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
+_CREATE_BREAKAWAY_FROM_JOB = getattr(
+    subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000
+)
 
 
 def _collect_posix_script_process_groups(
@@ -2073,40 +2076,28 @@ def _terminate_script_process_tree(
     proc: subprocess.Popen,
     *,
     pgid: Optional[int],
+    windows_job: Any = None,
 ) -> None:
     """Terminate and reap a timed-out cron script plus its descendants."""
     grace = max(float(_SCRIPT_TERMINATE_GRACE_SECONDS), 0.0)
 
     if sys.platform == "win32":
-        # CREATE_NEW_PROCESS_GROUP lets CTRL_BREAK reach console descendants.
-        # taskkill is the fallback that walks the full child tree.
+        # Popen retains a process HANDLE, so terminate() targets the exact
+        # helper process even if its numeric PID has already been recycled.
         try:
-            proc.send_signal(signal.CTRL_BREAK_EVENT)
-        except (AttributeError, OSError, ValueError):
-            try:
-                proc.terminate()
-            except OSError:
-                pass
-
-        try:
-            proc.wait(timeout=grace)
-        except subprocess.TimeoutExpired:
+            proc.terminate()
+        except OSError:
             pass
 
-        if proc.poll() is None:
+        # The scheduler-owned Job handle is the durable tree identity. It
+        # remains valid after the helper exits and cannot be confused with a
+        # reused PID. Closing the still-armed handle is a second fail-safe in
+        # the caller if explicit termination fails.
+        if windows_job is not None:
             try:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=max(grace, 1.0),
-                    creationflags=windows_hide_flags(),
-                )  # windows-footgun: ok
-            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+                windows_job.terminate()
+            except OSError:
+                logger.warning("Failed to terminate timed-out Windows cron Job Object")
     else:
         if pgid is not None:
             process_groups = _collect_posix_script_process_groups(proc.pid, pgid)
@@ -2259,6 +2250,15 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
+def _create_windows_cron_job() -> Any:
+    """Create the scheduler-owned Job Object for one Windows cron script."""
+    import uuid
+
+    from cron._windows_job_runner import _KillOnCloseJob
+
+    return _KillOnCloseJob(f"Local\\HermesCron-{uuid.uuid4().hex}")
+
+
 def _run_job_script(script_path: str) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2343,14 +2343,30 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
         argv = [python_exe, str(path)]
 
+    windows_job = None
     try:
         from tools.environments.local import _sanitize_subprocess_env
 
         popen_kwargs: dict[str, Any]
         if sys.platform == "win32":
-            create_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            runner_python, _ = _windows_cron_python_invocation(sys.executable)
+            job_runner = Path(__file__).with_name("_windows_job_runner.py")
+            windows_job = _create_windows_cron_job()
+            # The helper opens this exact scheduler-owned Job, joins it before
+            # spawning the script, and immediately closes its assignment-only
+            # handle. The scheduler remains the sole owner for the full run.
+            argv = [
+                runner_python,
+                str(job_runner),
+                "--job-name",
+                windows_job.name,
+                "--",
+                *argv,
+            ]
             popen_kwargs = {
-                "creationflags": windows_hide_flags() | create_group,
+                "creationflags": (
+                    windows_hide_flags() | _CREATE_BREAKAWAY_FROM_JOB
+                ),
                 "encoding": "utf-8",
                 "errors": "replace",
             }
@@ -2358,24 +2374,52 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             popen_kwargs = {"start_new_session": True}
         env = _sanitize_subprocess_env(os.environ.copy())
         env.update(env_overlay)
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=str(path.parent),
-            env=env,
-            **popen_kwargs,
-        )
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=str(path.parent),
+                env=env,
+                **popen_kwargs,
+            )
+        except PermissionError:
+            if sys.platform != "win32":
+                raise
+            # A restrictive parent Job can reject CREATE_BREAKAWAY_FROM_JOB.
+            # Retry without that bit; supported Windows versions can then nest
+            # the scheduler-owned cron Job under the parent Job.
+            popen_kwargs["creationflags"] &= ~_CREATE_BREAKAWAY_FROM_JOB
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=str(path.parent),
+                env=env,
+                **popen_kwargs,
+            )
         pgid = proc.pid if sys.platform != "win32" else None
         try:
             stdout_raw, stderr_raw = proc.communicate(timeout=script_timeout)
         except subprocess.TimeoutExpired:
-            _terminate_script_process_tree(proc, pgid=pgid)
+            _terminate_script_process_tree(
+                proc,
+                pgid=pgid,
+                windows_job=windows_job,
+            )
             raise
         except BaseException:
-            _terminate_script_process_tree(proc, pgid=pgid)
+            _terminate_script_process_tree(
+                proc,
+                pgid=pgid,
+                windows_job=windows_job,
+            )
             raise
+
+        if windows_job is not None:
+            windows_job.disarm_kill_on_close()
 
         stdout = (stdout_raw or "").strip()
         stderr = (stderr_raw or "").strip()
@@ -2404,6 +2448,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         return False, f"Script timed out after {script_timeout}s: {path}"
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
+    finally:
+        if windows_job is not None:
+            windows_job.close()
 
 
 def _run_job_script_with_claim_heartbeat(

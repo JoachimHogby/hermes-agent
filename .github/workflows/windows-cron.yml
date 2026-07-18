@@ -1,0 +1,59 @@
+name: Windows cron Job Object tests
+
+on:
+  pull_request:
+    paths:
+      - "cron/scheduler.py"
+      - "cron/_windows_job_runner.py"
+      - "tests/cron/test_cron_script.py"
+      - "scripts/run_tests.sh"
+      - "scripts/run_tests_parallel.py"
+      - ".github/workflows/windows-cron.yml"
+  push:
+    branches: [main]
+    paths:
+      - "cron/scheduler.py"
+      - "cron/_windows_job_runner.py"
+      - "tests/cron/test_cron_script.py"
+      - "scripts/run_tests.sh"
+      - "scripts/run_tests_parallel.py"
+      - ".github/workflows/windows-cron.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-cron-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-cron:
+    name: Native Windows cron process-tree tests
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra dev
+
+      - name: Run native Windows cron tests
+        shell: bash
+        run: |
+          HERMES_PYTHON="$PWD/.venv/Scripts/python.exe" \
+            bash scripts/run_tests.sh tests/cron/test_cron_script.py -v
