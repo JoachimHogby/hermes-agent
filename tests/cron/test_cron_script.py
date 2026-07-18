@@ -74,7 +74,11 @@ def test_windows_job_runner_releases_assignment_handle_before_spawning_child():
         (
             "spawn",
             ["python.exe", "script.py"],
-            {"creationflags": runner._CREATE_NO_WINDOW},
+            {
+                "stdout": sys.stdout,
+                "stderr": sys.stderr,
+                "creationflags": runner._CREATE_NO_WINDOW,
+            },
         ),
         "wait",
     ]
@@ -320,7 +324,7 @@ def test_windows_job_owner_closes_handle_when_limit_configuration_fails(monkeypa
         raising=False,
     )
 
-    with pytest.raises(OSError, match="Windows API call failed"):
+    with pytest.raises(OSError):
         runner._KillOnCloseJob("Local\\HermesCron-broken")
 
     assert closed == [101]

@@ -213,7 +213,15 @@ def run_child_in_job(
     finally:
         job.close()
 
-    child = popen_factory(argv, creationflags=_CREATE_NO_WINDOW)
+    # CREATE_NO_WINDOW helpers do not have console-backed standard handles.
+    # Pass the scheduler-provided pipe handles explicitly so the script's
+    # stdout/stderr survive the second process boundary.
+    child = popen_factory(
+        argv,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        creationflags=_CREATE_NO_WINDOW,
+    )
     return child.wait()
 
 
