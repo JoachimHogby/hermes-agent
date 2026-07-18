@@ -371,11 +371,18 @@ def build_top_level_parser():
             "hooks_auto_accept: in config.yaml)."
         ),
     )
-    chat_parser.add_argument(
+    checkpoint_group = chat_parser.add_mutually_exclusive_group()
+    checkpoint_group.add_argument(
         "--checkpoints",
         action="store_true",
         default=False,
         help="Enable filesystem checkpoints before destructive file operations (use /rollback to restore)",
+    )
+    checkpoint_group.add_argument(
+        "--no-checkpoints",
+        action="store_true",
+        default=False,
+        help="Disable filesystem checkpoints for this run, overriding config.yaml",
     )
     chat_parser.add_argument(
         "--max-turns",
