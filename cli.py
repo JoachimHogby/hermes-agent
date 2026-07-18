@@ -3722,6 +3722,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        no_checkpoints: bool = False,
     ):
         """
         Initialize the Hermes CLI.
@@ -3736,7 +3737,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             verbose: Enable verbose logging
             compact: Use compact display mode
             resume: Session ID to resume (restores conversation history from SQLite)
+            checkpoints: Enable filesystem checkpoints for this run
             pass_session_id: Include the session ID in the agent's system prompt
+            no_checkpoints: Disable filesystem checkpoints for this run
         """
         # Initialize Rich console
         self.console = Console()
@@ -3919,7 +3922,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         cp_cfg = CLI_CONFIG.get("checkpoints", {})
         if isinstance(cp_cfg, bool):
             cp_cfg = {"enabled": cp_cfg}
-        self.checkpoints_enabled = checkpoints or cp_cfg.get("enabled", False)
+        self.checkpoints_enabled = (
+            False if no_checkpoints else checkpoints or cp_cfg.get("enabled", False)
+        )
         self.checkpoint_max_snapshots = cp_cfg.get("max_snapshots", 20)
         self.checkpoint_max_total_size_mb = cp_cfg.get("max_total_size_mb", 500)
         self.checkpoint_max_file_size_mb = cp_cfg.get("max_file_size_mb", 10)
@@ -15401,6 +15406,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    no_checkpoints: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -15423,6 +15429,8 @@ def main(
         resume: Resume a previous session by its ID (e.g., 20260225_143052_a1b2c3)
         worktree: Run in an isolated git worktree (for parallel agents). Alias: -w
         w: Shorthand for --worktree
+        checkpoints: Enable filesystem checkpoints for this run
+        no_checkpoints: Disable filesystem checkpoints for this run
     
     Examples:
         python cli.py                            # Start interactive mode
@@ -15534,6 +15542,7 @@ def main(
         compact=compact,
         resume=resume,
         checkpoints=checkpoints,
+        no_checkpoints=no_checkpoints,
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
     )
