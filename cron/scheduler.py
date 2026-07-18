@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -2016,7 +2017,155 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
+_SCRIPT_TERMINATE_GRACE_SECONDS = 10.0
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
+
+
+def _collect_posix_script_process_groups(
+    root_pid: int,
+    root_pgid: int,
+) -> set[int]:
+    """Return process groups currently descended from a cron script leader."""
+    groups = {root_pgid}
+    ps_bin = shutil.which("ps")
+    if ps_bin is None:
+        return groups
+
+    try:
+        result = subprocess.run(
+            [ps_bin, "-axo", "pid=,ppid=,pgid="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )  # windows-footgun: POSIX-only helper
+    except (subprocess.TimeoutExpired, OSError):
+        return groups
+    if result.returncode != 0:
+        return groups
+
+    rows: dict[int, tuple[int, int]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        try:
+            pid, ppid, pgid = (int(value) for value in parts)
+        except ValueError:
+            continue
+        rows[pid] = (ppid, pgid)
+
+    descendants = {root_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, (ppid, pgid) in rows.items():
+            if pid in descendants or ppid not in descendants:
+                continue
+            descendants.add(pid)
+            if pgid > 1:
+                groups.add(pgid)
+            changed = True
+    return groups
+
+
+def _terminate_script_process_tree(
+    proc: subprocess.Popen,
+    *,
+    pgid: Optional[int],
+) -> None:
+    """Terminate and reap a timed-out cron script plus its descendants."""
+    grace = max(float(_SCRIPT_TERMINATE_GRACE_SECONDS), 0.0)
+
+    if sys.platform == "win32":
+        # CREATE_NEW_PROCESS_GROUP lets CTRL_BREAK reach console descendants.
+        # taskkill is the fallback that walks the full child tree.
+        try:
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+        except (AttributeError, OSError, ValueError):
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            pass
+
+        if proc.poll() is None:
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=max(grace, 1.0),
+                    creationflags=windows_hide_flags(),
+                )  # windows-footgun: ok
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+    else:
+        if pgid is not None:
+            process_groups = _collect_posix_script_process_groups(proc.pid, pgid)
+            ordered_groups = [pgid, *sorted(process_groups - {pgid})]
+            for process_group in ordered_groups:
+                try:
+                    os.killpg(process_group, signal.SIGTERM)  # windows-footgun: ok
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+
+            # The group leader can exit while a TERM-ignoring grandchild or a
+            # child that called setsid() stays alive. Poll every captured group.
+            deadline = time.monotonic() + grace
+            while time.monotonic() < deadline:
+                # Reap an exited leader so its zombie does not keep an otherwise
+                # empty process group visible for the full grace period.
+                proc.poll()
+                any_group_alive = False
+                for process_group in ordered_groups:
+                    try:
+                        os.killpg(process_group, 0)  # windows-footgun: ok
+                    except (ProcessLookupError, PermissionError, OSError):
+                        continue
+                    any_group_alive = True
+                    break
+                if not any_group_alive:
+                    break
+                time.sleep(min(0.05, max(deadline - time.monotonic(), 0.0)))
+
+            for process_group in ordered_groups:
+                try:
+                    os.killpg(process_group, signal.SIGKILL)  # windows-footgun: ok
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+        else:
+            try:
+                proc.terminate()
+                proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            except OSError:
+                pass
+
+    # Drain captured pipes and reap the group leader. This also prevents a
+    # zombie immediate child when the scheduler itself keeps running.
+    try:
+        proc.communicate(timeout=max(grace, 1.0))
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=max(grace, 1.0))
+        except (subprocess.TimeoutExpired, OSError):
+            pass
 
 
 def _get_script_timeout() -> int:
@@ -2197,26 +2346,39 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     try:
         from tools.environments.local import _sanitize_subprocess_env
 
-        popen_kwargs = {}
+        popen_kwargs: dict[str, Any]
         if sys.platform == "win32":
+            create_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
             popen_kwargs = {
-                "creationflags": windows_hide_flags(),
+                "creationflags": windows_hide_flags() | create_group,
                 "encoding": "utf-8",
                 "errors": "replace",
             }
+        else:
+            popen_kwargs = {"start_new_session": True}
         env = _sanitize_subprocess_env(os.environ.copy())
         env.update(env_overlay)
-        result = subprocess.run(
+        proc = subprocess.Popen(
             argv,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=script_timeout,
             cwd=str(path.parent),
             env=env,
             **popen_kwargs,
         )
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
+        pgid = proc.pid if sys.platform != "win32" else None
+        try:
+            stdout_raw, stderr_raw = proc.communicate(timeout=script_timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_script_process_tree(proc, pgid=pgid)
+            raise
+        except BaseException:
+            _terminate_script_process_tree(proc, pgid=pgid)
+            raise
+
+        stdout = (stdout_raw or "").strip()
+        stderr = (stderr_raw or "").strip()
 
         # Redact secrets from both stdout and stderr before any return path.
         try:
@@ -2228,8 +2390,8 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             stdout = "[REDACTED - redaction failed]"
             stderr = "[REDACTED - redaction failed]"
 
-        if result.returncode != 0:
-            parts = [f"Script exited with code {result.returncode}"]
+        if proc.returncode != 0:
+            parts = [f"Script exited with code {proc.returncode}"]
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
             if stdout:

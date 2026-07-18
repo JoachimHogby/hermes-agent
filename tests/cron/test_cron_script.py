@@ -9,16 +9,33 @@ Tests cover:
 
 import json
 import os
+import signal
 import sys
 import textwrap
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 # Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+
+def _capturing_popen(captured):
+    class FakePopen:
+        pid = 4242
+        returncode = 0
+
+        def __init__(self, argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+
+        def communicate(self, timeout=None):
+            captured["timeout"] = timeout
+            return "ok\n", ""
+
+    return FakePopen
 
 
 @pytest.fixture
@@ -194,22 +211,17 @@ class TestRunJobScript:
 
         captured = {}
 
-        def fake_run(argv, **kwargs):
-            captured["argv"] = argv
-            captured["kwargs"] = kwargs
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
-
         monkeypatch.setattr(sched_mod.sys, "platform", "win32")
         monkeypatch.setattr(sched_mod.sys, "executable", str(venv_python))
         monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", _capturing_popen(captured))
 
         success, output = _run_job_script("probe.py")
 
         assert success is True
         assert output == "ok"
         assert captured["argv"] == [str(base_python), str(script.resolve())]
-        assert captured["kwargs"]["creationflags"] == 0x08000000
+        assert captured["kwargs"]["creationflags"] == 0x08000200
         env = captured["kwargs"]["env"]
         assert env["VIRTUAL_ENV"] == str(venv)
         assert str(site_packages) in env["PYTHONPATH"]
@@ -231,21 +243,17 @@ class TestRunJobScript:
 
         captured = {}
 
-        def fake_run(argv, **kwargs):
-            captured["argv"] = argv
-            captured["kwargs"] = kwargs
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
-
         monkeypatch.setattr(sched_mod.sys, "platform", "win32")
         monkeypatch.setattr(sched_mod.sys, "executable", str(pythonw))
         monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", _capturing_popen(captured))
 
         success, output = _run_job_script("probe.py")
 
         assert success is True
         assert output == "ok"
         assert captured["argv"] == [str(python), str(script.resolve())]
+        assert captured["kwargs"]["creationflags"] == 0x08000200
         assert captured["kwargs"]["encoding"] == "utf-8"
         assert captured["kwargs"]["errors"] == "replace"
 
@@ -258,13 +266,8 @@ class TestRunJobScript:
 
         captured = {}
 
-        def fake_run(argv, **kwargs):
-            captured["argv"] = argv
-            captured["kwargs"] = kwargs
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
-
         monkeypatch.setattr(sched_mod.sys, "platform", "linux")
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", _capturing_popen(captured))
 
         success, output = _run_job_script("probe.py")
 
@@ -275,6 +278,7 @@ class TestRunJobScript:
         assert "creationflags" not in captured["kwargs"]
         assert "encoding" not in captured["kwargs"]
         assert "errors" not in captured["kwargs"]
+        assert captured["kwargs"]["start_new_session"] is True
 
     def test_script_empty_output(self, cron_env):
         from cron.scheduler import _run_job_script
@@ -299,6 +303,131 @@ class TestRunJobScript:
         success, output = _run_job_script(str(script))
         assert success is False
         assert "timed out" in output.lower()
+
+    @pytest.mark.live_system_guard_bypass
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group regression")
+    def test_script_timeout_terminates_descendant_process_group(self, cron_env, monkeypatch):
+        """A timed-out wrapper must not leave its runner child orphaned."""
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
+        monkeypatch.setattr(
+            sched_mod, "_SCRIPT_TERMINATE_GRACE_SECONDS", 0.2, raising=False
+        )
+
+        child_pid_file = cron_env / "child.pid"
+        script = cron_env / "scripts" / "spawns_child.py"
+        child_code = (
+            "import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(30)"
+        )
+        script.write_text(
+            textwrap.dedent(
+                f"""\
+                import subprocess
+                import sys
+                import time
+                from pathlib import Path
+
+                child = subprocess.Popen(
+                    [sys.executable, "-c", {child_code!r}],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                Path({str(child_pid_file)!r}).write_text(str(child.pid))
+                time.sleep(30)
+                """
+            )
+        )
+
+        success, output = _run_job_script(str(script))
+        assert success is False
+        assert "timed out" in output.lower()
+        assert child_pid_file.exists()
+        child_pid = int(child_pid_file.read_text())
+
+        def child_is_alive() -> bool:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            return True
+
+        try:
+            deadline = time.monotonic() + 3
+            while child_is_alive() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not child_is_alive(), f"orphaned child process still alive: {child_pid}"
+        finally:
+            if child_is_alive():
+                os.kill(child_pid, signal.SIGKILL)
+
+    @pytest.mark.live_system_guard_bypass
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group regression")
+    def test_script_timeout_terminates_descendant_in_new_session(self, cron_env, monkeypatch):
+        """A timed-out wrapper must also kill descendants that called setsid()."""
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
+        monkeypatch.setattr(
+            sched_mod, "_SCRIPT_TERMINATE_GRACE_SECONDS", 0.2, raising=False
+        )
+
+        child_pid_file = cron_env / "detached-child.pid"
+        script = cron_env / "scripts" / "spawns_detached_child.py"
+        child_code = (
+            "import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(30)"
+        )
+        script.write_text(
+            textwrap.dedent(
+                f"""\
+                import subprocess
+                import sys
+                import time
+                from pathlib import Path
+
+                child = subprocess.Popen(
+                    [sys.executable, "-c", {child_code!r}],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                Path({str(child_pid_file)!r}).write_text(str(child.pid))
+                time.sleep(30)
+                """
+            )
+        )
+
+        success, output = _run_job_script(str(script))
+        assert success is False
+        assert "timed out" in output.lower()
+        assert child_pid_file.exists()
+        child_pid = int(child_pid_file.read_text())
+
+        def child_is_alive() -> bool:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            return True
+
+        try:
+            deadline = time.monotonic() + 3
+            while child_is_alive() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not child_is_alive(), f"detached child process still alive: {child_pid}"
+        finally:
+            if child_is_alive():
+                os.kill(child_pid, signal.SIGKILL)
 
     def test_script_json_output(self, cron_env):
         """Scripts can output structured JSON for the LLM to parse."""
